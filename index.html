@@ -21,13 +21,13 @@
   }
   #minimap {
     position: absolute; top: 10px; right: 10px;
-    width: 260px; padding: 4px; box-sizing: border-box;
+    width: 650px; padding: 6px; box-sizing: border-box;
     background: rgba(0,0,0,0.55); border-radius: 6px;
   }
   #minimap canvas { display: block; width: 100%; height: auto; border-radius: 4px; }
   #speedo {
     position: absolute; bottom: 16px; right: 16px;
-    width: 170px; height: 170px;
+    width: 425px; height: 425px;
     pointer-events: none; user-select: none;
     filter: drop-shadow(0 2px 6px rgba(0,0,0,0.6));
   }
@@ -114,7 +114,7 @@ const CLASS_TABLE = [
 // the wrong way, flip START_FORWARD_FLIP.
 const START_POLE_A_PX   = [595, 233];
 const START_POLE_B_PX   = [582, 244];
-const START_FORWARD_FLIP = false;
+const START_FORWARD_FLIP = true;
 const MIN_LAP_TIME_S    = 8;       // ignore crossings closer than this (debounce)
 
 // ---------- Scene ----------
@@ -860,7 +860,7 @@ function updateLap(nowMs) {
   const dz = car.pos.z - startWorld.z;
   const fwd  = dx * startForward.x + dz * startForward.z;       // along the heading
   const side = dx * (-startForward.z) + dz * startForward.x;    // across the line (perpendicular)
-  const within = Math.abs(side) <= START_LINE_HALF_W;
+  const within = Math.abs(side) <= startLineHalfW;
 
   const prev = lapState.prevSignedFwd;
   // Crossing the start line forward = sign change of `fwd` from negative to positive
