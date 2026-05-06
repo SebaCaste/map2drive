@@ -2,6 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
 <title>map2drive — Karting Wohlen</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: monospace; color: #fff; }
@@ -31,6 +34,42 @@
     pointer-events: none; user-select: none;
     filter: drop-shadow(0 2px 6px rgba(0,0,0,0.6));
   }
+
+  /* ---- Touch controls (shown only when body has class .is-mobile) ---- */
+  #touchControls { display: none; }
+  body.is-mobile #touchControls { display: block; }
+  body.is-mobile #help { display: none; }
+  body.is-mobile #minimap { width: 220px; padding: 3px; }
+  body.is-mobile #speedo  { width: 140px; height: 140px; bottom: 8px; right: 8px; }
+  body.is-mobile #hud     { font-size: 11px; padding: 6px 8px; }
+  .touch-btn {
+    position: absolute; pointer-events: auto; user-select: none;
+    -webkit-tap-highlight-color: transparent; touch-action: none;
+    width: 90px; height: 90px; border-radius: 50%;
+    background: rgba(255,255,255,0.12); border: 2px solid rgba(255,255,255,0.45);
+    color: #fff; font: bold 24px/90px monospace; text-align: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  }
+  .touch-btn.active { background: rgba(255,255,255,0.35); }
+  .touch-btn.gas    { background: rgba(50, 200, 80, 0.30); border-color: #6fdf86; }
+  .touch-btn.gas.active   { background: rgba(50, 200, 80, 0.65); }
+  .touch-btn.brake  { background: rgba(220, 60, 60, 0.30); border-color: #ff8181; }
+  .touch-btn.brake.active { background: rgba(220, 60, 60, 0.65); }
+  #btnL { left: 16px; bottom: 116px; }
+  #btnR { left: 116px; bottom: 116px; }
+  #btnGas { right: 16px; bottom: 200px; }
+  #btnBrake { right: 16px; bottom: 100px; }
+  #btnReset {
+    left: 16px; top: 16px; width: 60px; height: 38px;
+    border-radius: 8px; line-height: 38px; font-size: 13px;
+  }
+  #orientHint {
+    display: none; position: absolute; inset: 0;
+    background: rgba(0,0,0,0.85); color: #fff;
+    align-items: center; justify-content: center; text-align: center;
+    font-size: 18px; padding: 24px; z-index: 999;
+  }
+  body.is-mobile.portrait #orientHint { display: flex; }
 </style>
 </head>
 <body>
@@ -68,6 +107,15 @@
         fill="#fff" font-size="14" font-family="monospace" font-weight="bold">0</text>
   <text x="50" y="84" text-anchor="middle" fill="#aaa" font-size="6" font-family="monospace">km/h</text>
 </svg>
+
+<div id="touchControls">
+  <div id="btnL"     class="touch-btn">◀</div>
+  <div id="btnR"     class="touch-btn">▶</div>
+  <div id="btnGas"   class="touch-btn gas">GAS</div>
+  <div id="btnBrake" class="touch-btn brake">BRK</div>
+  <div id="btnReset" class="touch-btn">R</div>
+</div>
+<div id="orientHint">↻ Rotate your phone to landscape for a better view</div>
 
 <div id="help">
   Click to lock mouse · W/S throttle &amp; brake · A/D steer · Mouse: look · Shift: handbrake · R: reset · M: toggle photo/segmentation
@@ -998,6 +1046,62 @@ carRig.add(cockpit.group);
 
 // ---------- Input ----------
 const keys = {};
+// ---------- Mobile detection + touch controls ----------
+const isMobile = (() => {
+  const uaMobile = /Android|iPhone|iPad|iPod|Mobile|webOS|BlackBerry|Windows Phone/i.test(navigator.userAgent);
+  const hasTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  return uaMobile || (hasTouch && Math.min(window.innerWidth, window.innerHeight) < 900);
+})();
+if (isMobile) document.body.classList.add('is-mobile');
+function updateOrientationClass() {
+  document.body.classList.toggle('portrait', window.innerHeight > window.innerWidth);
+}
+updateOrientationClass();
+addEventListener('resize', updateOrientationClass);
+addEventListener('orientationchange', updateOrientationClass);
+
+function bindTouchButton(id, code) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const press = e => { e.preventDefault(); keys[code] = true; el.classList.add('active'); };
+  const release = e => { e.preventDefault(); keys[code] = false; el.classList.remove('active'); };
+  el.addEventListener('touchstart', press,   { passive: false });
+  el.addEventListener('touchend',   release, { passive: false });
+  el.addEventListener('touchcancel',release, { passive: false });
+  el.addEventListener('mousedown',  press);
+  el.addEventListener('mouseup',    release);
+  el.addEventListener('mouseleave', release);
+}
+bindTouchButton('btnL',     'KeyA');
+bindTouchButton('btnR',     'KeyD');
+bindTouchButton('btnGas',   'KeyW');
+bindTouchButton('btnBrake', 'KeyS');
+const resetEl = document.getElementById('btnReset');
+if (resetEl) {
+  resetEl.addEventListener('touchstart', e => { e.preventDefault(); spawnOnTrack && spawnOnTrack(); });
+  resetEl.addEventListener('mousedown',  e => { e.preventDefault(); spawnOnTrack && spawnOnTrack(); });
+}
+
+// Touch-drag anywhere on the canvas (outside the buttons) pans the camera.
+if (isMobile) {
+  let lastTouch = null;
+  renderer.domElement.addEventListener('touchstart', e => {
+    if (e.touches.length !== 1) { lastTouch = null; return; }
+    lastTouch = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  }, { passive: true });
+  renderer.domElement.addEventListener('touchmove', e => {
+    if (e.touches.length !== 1 || !lastTouch) return;
+    const t = e.touches[0];
+    const dx = t.clientX - lastTouch.x;
+    const dy = t.clientY - lastTouch.y;
+    lastTouch = { x: t.clientX, y: t.clientY };
+    mouseYaw   -= dx * 0.005;
+    mousePitch -= dy * 0.005;
+    mousePitch = Math.max(-1.0, Math.min(1.0, mousePitch));
+  }, { passive: true });
+  renderer.domElement.addEventListener('touchend',   () => { lastTouch = null; }, { passive: true });
+}
+
 addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'KeyR') spawnOnTrack();
@@ -1007,6 +1111,7 @@ addEventListener('keyup', e => { keys[e.code] = false; });
 
 let mouseYaw = 0, mousePitch = 0;
 renderer.domElement.addEventListener('click', () => {
+  if (isMobile) return;     // pointer-lock has no effect on touch devices
   renderer.domElement.requestPointerLock();
 });
 addEventListener('mousemove', e => {
