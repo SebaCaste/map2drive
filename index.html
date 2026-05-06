@@ -1,0 +1,1218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>map2drive — Karting Wohlen</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: monospace; color: #fff; }
+  #hud {
+    position: absolute; top: 10px; left: 10px; padding: 8px 12px;
+    background: rgba(0,0,0,0.55); border-radius: 6px; font-size: 13px; line-height: 1.5;
+    pointer-events: none; user-select: none;
+  }
+  #hud .surf { font-weight: bold; }
+  #help {
+    position: absolute; bottom: 10px; left: 10px; padding: 6px 10px;
+    background: rgba(0,0,0,0.55); border-radius: 6px; font-size: 12px; opacity: 0.85;
+  }
+  #loading {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #111; color: #9cf; font-size: 16px;
+  }
+  #minimap {
+    position: absolute; top: 10px; right: 10px;
+    width: 260px; padding: 4px; box-sizing: border-box;
+    background: rgba(0,0,0,0.55); border-radius: 6px;
+  }
+  #minimap canvas { display: block; width: 100%; height: auto; border-radius: 4px; }
+  #speedo {
+    position: absolute; bottom: 16px; right: 16px;
+    width: 170px; height: 170px;
+    pointer-events: none; user-select: none;
+    filter: drop-shadow(0 2px 6px rgba(0,0,0,0.6));
+  }
+</style>
+</head>
+<body>
+<div id="loading">Loading map…</div>
+<div id="hud">
+  Speed: <span id="spd">0</span> km/h<br/>
+  Surface: <span id="surf" class="surf">-</span><br/>
+  Grip (μ): <span id="mu">-</span><br/>
+  <hr style="border:0;border-top:1px solid #555;margin:4px 0"/>
+  Lap: <span id="lapN">0</span><br/>
+  Current: <span id="lapCur">0:00.000</span><br/>
+  Last:    <span id="lapLast">—</span><br/>
+  Best:    <span id="lapBest" style="color:#9fffa6">—</span><br/>
+  <hr style="border:0;border-top:1px solid #555;margin:4px 0"/>
+  Pos px (x,y): <span id="posPx" style="color:#ffd66b">-</span><br/>
+  Heading:      <span id="hdg" style="color:#ffd66b">-</span>°
+</div>
+<div id="minimap"><canvas id="minimapCanvas" width="520" height="292"></canvas></div>
+
+<svg id="speedo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="dialGrad" cx="50%" cy="50%" r="55%">
+      <stop offset="0%"  stop-color="#222"/>
+      <stop offset="100%" stop-color="#000"/>
+    </radialGradient>
+  </defs>
+  <circle cx="50" cy="50" r="48" fill="url(#dialGrad)" stroke="#fff8" stroke-width="1.5"/>
+  <g id="speedoTicks" stroke="#bbb" stroke-width="0.6"></g>
+  <g id="speedoLabels" fill="#ddd" font-family="monospace" font-size="5" text-anchor="middle"></g>
+  <line id="speedoNeedle" x1="50" y1="50" x2="50" y2="12"
+        stroke="#ff3030" stroke-width="2" stroke-linecap="round"
+        transform="rotate(-135 50 50)"/>
+  <circle cx="50" cy="50" r="3.2" fill="#ff3030"/>
+  <text id="speedoTxt" x="50" y="74" text-anchor="middle"
+        fill="#fff" font-size="14" font-family="monospace" font-weight="bold">0</text>
+  <text x="50" y="84" text-anchor="middle" fill="#aaa" font-size="6" font-family="monospace">km/h</text>
+</svg>
+
+<div id="help">
+  Click to lock mouse · W/S throttle &amp; brake · A/D steer · Mouse: look · Shift: handbrake · R: reset · M: toggle photo/segmentation
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+const MAP_IMAGE = 'Karting_Wohlen_5.jpg';
+const SEG_IMAGE = 'track_clean_color_clean.png';
+const SCENE_JSON = 'scene.json';
+const MAP_WIDTH_M = 375;     // tune to taste — real-world width the image covers
+// Source-image dimensions used by the VLM JSON's coordinate system. Hard-coded because
+// the JSON is authored against this specific resolution.
+const JSON_IMG_W = 800, JSON_IMG_H = 449;
+
+// Class palette from vlm_prompt.md — used for nearest-color classification of the segmentation PNG.
+const CLASS_TABLE = [
+  { name: 'track',        rgb: [ 40,  40,  40], mu: 1.00, maxSpeed: 60 },
+  { name: 'runoff',       rgb: [110, 110, 110], mu: 0.75, maxSpeed: 35 },
+  { name: 'parking_road', rgb: [160, 160, 160], mu: 0.90, maxSpeed: 40 },
+  { name: 'curb',         rgb: [220,  40,  40], mu: 0.70, maxSpeed: 30 },
+  { name: 'barrier',      rgb: [255, 120,   0], mu: 0.30, maxSpeed: 10 },
+  { name: 'grass',        rgb: [ 60, 160,  70], mu: 0.35, maxSpeed: 14 },
+  { name: 'tree_canopy',  rgb: [ 20,  80,  30], mu: 0.20, maxSpeed:  6 },
+  { name: 'building',     rgb: [200, 170, 120], mu: 0.10, maxSpeed:  2 },
+  { name: 'vehicle',      rgb: [ 80,  60, 200], mu: 0.10, maxSpeed:  2 },
+  { name: 'rail',         rgb: [180, 180, 180], mu: 0.50, maxSpeed: 18 },
+  { name: 'background',   rgb: [  0,   0,   0], mu: 0.20, maxSpeed:  8 },
+];
+
+// ====== Start / finish line ======
+// Two posts in JSON image-pixel coords (800 × 449, top-left origin, +y down). The line spans
+// from pole A to pole B; forward direction is perpendicular to it. If the kart spawns facing
+// the wrong way, flip START_FORWARD_FLIP.
+const START_POLE_A_PX   = [595, 233];
+const START_POLE_B_PX   = [582, 244];
+const START_FORWARD_FLIP = false;
+const MIN_LAP_TIME_S    = 8;       // ignore crossings closer than this (debounce)
+
+// ---------- Scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9cc6e8);
+scene.fog = new THREE.Fog(0x9cc6e8, 250, 900);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(78, window.innerWidth / window.innerHeight, 0.05, 2000);
+
+const sun = new THREE.DirectionalLight(0xfff1d6, 1.1);
+sun.position.set(120, 220, 80);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -180; sun.shadow.camera.right = 180;
+sun.shadow.camera.top = 180; sun.shadow.camera.bottom = -180;
+sun.shadow.camera.near = 1; sun.shadow.camera.far = 600;
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xbfd9ff, 0x4a5a3a, 0.55));
+
+// ---------- Map plane ----------
+const groundSize = { w: 0, h: 0 };
+const texLoader = new THREE.TextureLoader();
+let groundMaterial = null;
+let photoTex = null, segTex = null;
+let showSegmentation = false;
+
+function loadTex(url) {
+  return new Promise(res => texLoader.load(url, t => {
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    res(t);
+  }));
+}
+
+Promise.all([loadTex(MAP_IMAGE), loadTex(SEG_IMAGE), fetch(SCENE_JSON).then(r => r.json())])
+  .then(([mapTex, sTex, sceneJson]) => {
+    photoTex = mapTex; segTex = sTex;
+    const aspect = mapTex.image.width / mapTex.image.height;
+    const w = MAP_WIDTH_M;
+    const h = MAP_WIDTH_M / aspect;
+    groundSize.w = w; groundSize.h = h;
+
+    groundMaterial = new THREE.MeshStandardMaterial({ map: photoTex, roughness: 0.95 });
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(w, h, 1, 1), groundMaterial);
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const skirt = new THREE.Mesh(
+      new THREE.PlaneGeometry(w * 4, h * 4),
+      new THREE.MeshStandardMaterial({ color: 0x6b7a4a, roughness: 1.0 })
+    );
+    skirt.rotation.x = -Math.PI / 2;
+    skirt.position.y = -0.05;
+    skirt.receiveShadow = true;
+    scene.add(skirt);
+
+    setupSampler(segTex.image);    // friction comes from the segmentation, not the photo
+    buildTrackAnalysis();          // compute track mask, distance transform, centerline skeleton
+    drawCenterline();              // yellow centerline as a transparent ground overlay
+    populateFromJson(sceneJson);   // filters objects whose position is on the track
+    buildBorderPosts();
+    setStartFromConfig();
+    drawStartLine();
+    spawnOnTrack();
+    document.getElementById('loading').remove();
+  });
+
+function setGroundTexture(useSeg) {
+  if (!groundMaterial) return;
+  groundMaterial.map = useSeg ? segTex : photoTex;
+  groundMaterial.needsUpdate = true;
+  showSegmentation = useSeg;
+}
+
+// ---------- Surface sampler ----------
+let sampleCtx = null, sampleW = 0, sampleH = 0;
+function setupSampler(img) {
+  const c = document.createElement('canvas');
+  const maxDim = 1024;
+  const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+  c.width = Math.round(img.width * scale);
+  c.height = Math.round(img.height * scale);
+  sampleCtx = c.getContext('2d', { willReadFrequently: true });
+  sampleCtx.drawImage(img, 0, 0, c.width, c.height);
+  sampleW = c.width; sampleH = c.height;
+}
+function worldToPixel(x, z) {
+  const u = (x + groundSize.w / 2) / groundSize.w;
+  const v = (z + groundSize.h / 2) / groundSize.h;
+  return [Math.floor(u * sampleW), Math.floor(v * sampleH)];
+}
+function pixelToWorld(px, py) {
+  const x = (px / sampleW) * groundSize.w - groundSize.w / 2;
+  const z = (py / sampleH) * groundSize.h - groundSize.h / 2;
+  return [x, z];
+}
+
+// Classify by nearest palette color (Euclidean RGB distance) into a CLASS_TABLE entry.
+function classifyRGB(r, g, b) {
+  let best = CLASS_TABLE[0], bestD = Infinity;
+  for (const c of CLASS_TABLE) {
+    const dr = r - c.rgb[0], dg = g - c.rgb[1], db = b - c.rgb[2];
+    const d = dr * dr + dg * dg + db * db;
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return best;
+}
+function sampleSurface(x, z) {
+  if (!sampleCtx) return { name: 'asphalt', mu: 1.0, maxSpeed: 30 };
+  const [px, py] = worldToPixel(x, z);
+  if (px < 0 || py < 0 || px >= sampleW || py >= sampleH) {
+    return { name: 'off-map', mu: 0.2, maxSpeed: 5 };
+  }
+  const d = sampleCtx.getImageData(px, py, 1, 1).data;
+  return classifyRGB(d[0], d[1], d[2]);
+}
+// ---------- Track analysis: binary mask, distance transform, skeleton centerline ----------
+let trackMask = null;          // Uint8Array, 1 if pixel is "track"
+let trackDT = null;            // Float32Array, distance to nearest non-track (chamfer 3-4 units)
+let trackSkeleton = null;      // Uint8Array, 1 if pixel is on the centerline ridge
+let avgHalfWidthPx = 0;        // median DT along skeleton, in pixels
+const CHAMFER_TO_PX = 1 / 3;
+
+function buildTrackAnalysis() {
+  const W = sampleW, H = sampleH;
+  const data = sampleCtx.getImageData(0, 0, W, H).data;
+  trackMask = new Uint8Array(W * H);
+  for (let i = 0, j = 0; i < trackMask.length; i++, j += 4) {
+    const c = classifyRGB(data[j], data[j + 1], data[j + 2]);
+    trackMask[i] = c.name === 'track' ? 1 : 0;
+  }
+  // Distance transform — chamfer (3,4). Inside track = INF, edge = 0; minimize via two passes.
+  const INF = 1e9;
+  trackDT = new Float32Array(W * H);
+  for (let i = 0; i < trackDT.length; i++) trackDT[i] = trackMask[i] ? INF : 0;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    if (!trackMask[i]) continue;
+    let v = trackDT[i];
+    if (x > 0)            v = Math.min(v, trackDT[i - 1] + 3);
+    if (y > 0)            v = Math.min(v, trackDT[i - W] + 3);
+    if (x > 0 && y > 0)   v = Math.min(v, trackDT[i - W - 1] + 4);
+    if (x < W - 1 && y > 0) v = Math.min(v, trackDT[i - W + 1] + 4);
+    trackDT[i] = v;
+  }
+  for (let y = H - 1; y >= 0; y--) for (let x = W - 1; x >= 0; x--) {
+    const i = y * W + x;
+    if (!trackMask[i]) continue;
+    let v = trackDT[i];
+    if (x < W - 1)              v = Math.min(v, trackDT[i + 1] + 3);
+    if (y < H - 1)              v = Math.min(v, trackDT[i + W] + 3);
+    if (x < W - 1 && y < H - 1) v = Math.min(v, trackDT[i + W + 1] + 4);
+    if (x > 0 && y < H - 1)     v = Math.min(v, trackDT[i + W - 1] + 4);
+    trackDT[i] = v;
+  }
+  // Skeleton = local maxima of DT (8-neighborhood). Coarse but cheap.
+  trackSkeleton = new Uint8Array(W * H);
+  const skelDts = [];
+  for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+    const i = y * W + x;
+    if (!trackMask[i]) continue;
+    const v = trackDT[i];
+    if (v < 6) continue;
+    let isMax = true;
+    for (let dy = -1; dy <= 1 && isMax; dy++)
+      for (let dx = -1; dx <= 1 && isMax; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        if (trackDT[i + dy * W + dx] > v) isMax = false;
+      }
+    if (isMax) { trackSkeleton[i] = 1; skelDts.push(v); }
+  }
+  skelDts.sort((a, b) => a - b);
+  const med = skelDts.length ? skelDts[Math.floor(skelDts.length / 2)] : 0;
+  avgHalfWidthPx = med * CHAMFER_TO_PX;
+  const halfWidthM = avgHalfWidthPx / sampleW * groundSize.w;
+  console.log(`track avg half-width ≈ ${avgHalfWidthPx.toFixed(1)} px / ${halfWidthM.toFixed(1)} m  (skeleton points: ${skelDts.length})`);
+}
+
+function isOnTrack(worldX, worldZ) {
+  if (!trackMask) return false;
+  const [px, py] = worldToPixel(worldX, worldZ);
+  if (px < 0 || py < 0 || px >= sampleW || py >= sampleH) return false;
+  return trackMask[py * sampleW + px] === 1;
+}
+
+function drawCenterline() {
+  const cv = document.createElement('canvas');
+  cv.width = sampleW; cv.height = sampleH;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = 'rgba(255, 230, 0, 0.95)';
+  // 3x3 fill per skeleton pixel so consecutive ridge pixels glue into a continuous line.
+  for (let y = 0; y < sampleH; y++) for (let x = 0; x < sampleW; x++) {
+    if (trackSkeleton[y * sampleW + x]) ctx.fillRect(x - 1, y - 1, 3, 3);
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const overlay = new THREE.Mesh(
+    new THREE.PlaneGeometry(groundSize.w, groundSize.h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false })
+  );
+  overlay.rotation.x = -Math.PI / 2;
+  overlay.position.y = 0.02;
+  scene.add(overlay);
+}
+
+function classifyAt(px, py) {
+  if (px < 0 || py < 0 || px >= sampleW || py >= sampleH) return null;
+  const d = sampleCtx.getImageData(px, py, 1, 1).data;
+  return classifyRGB(d[0], d[1], d[2]);
+}
+
+// ---------- World population from VLM JSON ----------
+// JSON coordinates are pixels in JSON_IMG_W x JSON_IMG_H, top-left origin, +y down.
+function jsonPxToWorld(px, py) {
+  const u = px / JSON_IMG_W;
+  const v = py / JSON_IMG_H;
+  return [(u - 0.5) * groundSize.w, (v - 0.5) * groundSize.h];
+}
+function worldToJsonPx(x, z) {
+  const u = x / groundSize.w + 0.5;
+  const v = z / groundSize.h + 0.5;
+  return [Math.round(u * JSON_IMG_W), Math.round(v * JSON_IMG_H)];
+}
+function jsonSizeToWorld(dx, dy) {
+  return [dx / JSON_IMG_W * groundSize.w, dy / JSON_IMG_H * groundSize.h];
+}
+
+function populateFromJson(scn) {
+  let skipped = 0;
+
+  const trees = scn.objects.filter(o => o.class === 'tree_canopy');
+  for (const t of trees) {
+    const [x, z] = jsonPxToWorld(t.center[0], t.center[1]);
+    if (isOnTrack(x, z)) { skipped++; continue; }
+    // Convert canopy radius (top-down pixels) into world units, then derive a height.
+    const [rw] = jsonSizeToWorld(t.radius_px, t.radius_px);
+    const tree = makeTreeMesh(rw);
+    tree.position.set(x, 0, z);
+    tree.rotation.y = Math.random() * Math.PI * 2;
+    scene.add(tree);
+  }
+
+  const buildingMat = new THREE.MeshStandardMaterial({ color: 0xb8a070, roughness: 0.9 });
+  for (const b of scn.objects.filter(o => o.class === 'building')) {
+    const [x0, z0] = jsonPxToWorld(b.bbox[0], b.bbox[1]);
+    const [x1, z1] = jsonPxToWorld(b.bbox[2], b.bbox[3]);
+    const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+    if (isOnTrack(cx, cz)) { skipped++; continue; }
+    const w = Math.abs(x1 - x0), d = Math.abs(z1 - z0);
+    const h = 4 + Math.min(w, d) * 0.15;
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), buildingMat);
+    m.position.set(cx, h / 2, cz);
+    m.castShadow = true; m.receiveShadow = true;
+    scene.add(m);
+    // Pitched roof
+    const roof = new THREE.Mesh(
+      new THREE.ConeGeometry(Math.max(w, d) * 0.65, h * 0.4, 4),
+      new THREE.MeshStandardMaterial({ color: 0x7c3a2a, roughness: 0.95 })
+    );
+    roof.position.set(cx, h + h * 0.2, cz);
+    roof.rotation.y = Math.PI / 4;
+    roof.castShadow = true;
+    scene.add(roof);
+  }
+
+  const vehicleMat = new THREE.MeshStandardMaterial({ color: 0x3a4ec8, roughness: 0.4, metalness: 0.3 });
+  const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.95 });
+  for (const v of scn.objects.filter(o => o.class === 'vehicle')) {
+    const [x0, z0] = jsonPxToWorld(v.bbox[0], v.bbox[1]);
+    const [x1, z1] = jsonPxToWorld(v.bbox[2], v.bbox[3]);
+    const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+    if (isOnTrack(cx, cz)) { skipped++; continue; }
+    const w = Math.abs(x1 - x0), d = Math.abs(z1 - z0);
+    // Choose long axis as forward axis; fallback to heading_deg if provided.
+    const car = new THREE.Group();
+    const longSide = Math.max(w, d), shortSide = Math.min(w, d);
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(shortSide, 1.2, longSide),
+      vehicleMat.clone()
+    );
+    body.material.color.setHSL(Math.random(), 0.55, 0.45);
+    body.position.y = 0.7;
+    body.castShadow = true;
+    car.add(body);
+    // Cabin
+    const cab = new THREE.Mesh(
+      new THREE.BoxGeometry(shortSide * 0.85, 0.6, longSide * 0.55),
+      new THREE.MeshStandardMaterial({ color: 0x202028, roughness: 0.3 })
+    );
+    cab.position.set(0, 1.55, -longSide * 0.05);
+    cab.castShadow = true;
+    car.add(cab);
+    car.position.set(cx, 0, cz);
+    if (v.heading_deg != null) {
+      car.rotation.y = -v.heading_deg * Math.PI / 180;
+    } else if (w > d) {
+      car.rotation.y = Math.PI / 2;
+    }
+    scene.add(car);
+  }
+
+  if (skipped) console.log(`populateFromJson: skipped ${skipped} object(s) lying on the track`);
+}
+
+function makeTreeMesh(canopyRadius = 1.8) {
+  // Single tree built from a trunk + 1-2 canopy cones; reused via clones.
+  const g = new THREE.Group();
+  const trunkH = 1.6 + Math.random() * 1.0;
+  const trunk = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.18, 0.25, trunkH, 6),
+    new THREE.MeshStandardMaterial({ color: 0x4a3320, roughness: 1.0 })
+  );
+  trunk.position.y = trunkH / 2;
+  trunk.castShadow = true;
+  g.add(trunk);
+
+  const canopyR = canopyRadius * (0.85 + Math.random() * 0.3);
+  const canopyH = canopyR * (1.4 + Math.random() * 0.6);
+  const canopyMat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color().setHSL(0.27 + Math.random() * 0.05, 0.55, 0.28 + Math.random() * 0.08),
+    roughness: 1.0, flatShading: true,
+  });
+  const canopy = new THREE.Mesh(new THREE.ConeGeometry(canopyR, canopyH, 7), canopyMat);
+  canopy.position.y = trunkH + canopyH / 2 - 0.3;
+  canopy.castShadow = true;
+  g.add(canopy);
+
+  if (Math.random() < 0.6) {
+    const c2 = new THREE.Mesh(
+      new THREE.ConeGeometry(canopyR * 0.75, canopyH * 0.75, 7),
+      canopyMat
+    );
+    c2.position.y = trunkH + canopyH * 0.5;
+    c2.castShadow = true;
+    g.add(c2);
+  }
+  return g;
+}
+
+// Border posts along track edges, derived from the segmentation: a "track" pixel adjacent to
+// non-track is an edge. Adds visual depth to the track outline.
+// function buildBorderPosts() {
+//   const stride = 4;
+//   const edges = [];
+//   const isTrack = (px, py) => {
+//     const c = classifyAt(px, py);
+//     return c && c.name === 'track';
+//   };
+//   for (let py = 0; py < sampleH; py += stride) {
+//     for (let px = 0; px < sampleW; px += stride) {
+//       if (!isTrack(px, py)) continue;
+//       let isEdge = false;
+//       for (const [ox, oy] of [[stride,0],[-stride,0],[0,stride],[0,-stride]]) {
+//         if (!isTrack(px + ox, py + oy)) { isEdge = true; break; }
+//       }
+//       if (isEdge) edges.push([px, py]);
+//     }
+//   }
+//   if (!edges.length) return;
+//   const postGeom = new THREE.CylinderGeometry(0.07, 0.07, 0.6, 6);
+//   const matW = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 });
+//   const matR = new THREE.MeshStandardMaterial({ color: 0xcc1f1f, roughness: 0.9 });
+//   const instW = new THREE.InstancedMesh(postGeom, matW, edges.length);
+//   const instR = new THREE.InstancedMesh(postGeom, matR, edges.length);
+//   const m = new THREE.Matrix4();
+//   let wIdx = 0, rIdx = 0;
+//   for (let i = 0; i < edges.length; i++) {
+//     const [pxS, pyS] = edges[i];
+//     // Convert sampler-px (1024-max) back to world via pixelToWorld which uses sampleW/H.
+//     const [x, z] = pixelToWorld(pxS, pyS);
+//     m.makeTranslation(x, 0.3, z);
+//     if (i % 2 === 0) instW.setMatrixAt(wIdx++, m); else instR.setMatrixAt(rIdx++, m);
+//   }
+//   instW.count = wIdx; instR.count = rIdx;
+//   scene.add(instW); scene.add(instR);
+// }
+function buildBorderPosts() {
+
+  const stride = 4;
+  const edges = [];
+
+  const W = sampleW, H = sampleH;
+
+  // --- Define drivable surfaces ---
+  function isDrivable(className) {
+    return (
+      className === 'track' ||
+      className === 'curb' ||
+      className === 'runoff' ||
+      className === 'parking_road'
+    );
+  }
+
+  for (let py = 1; py < H - 1; py += stride) {
+    for (let px = 1; px < W - 1; px += stride) {
+
+      const i = py * W + px;
+      if (!trackMask[i]) continue;
+
+      const dt = trackDT[i];
+
+      // --- Strong center rejection (removes mid-track posts completely) ---
+      if (dt > avgHalfWidthPx * 0.35) continue;
+
+      // --- Gradient check (removes flat interior regions) ---
+      const gradX = trackDT[i + 1] - trackDT[i - 1];
+      const gradY = trackDT[i + W] - trackDT[i - W];
+      const gradMag = Math.abs(gradX) + Math.abs(gradY);
+
+      if (gradMag < 2) continue;
+
+      // --- Semantic boundary check ---
+      let touchesNonDrivable = false;
+
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+
+          if (ox === 0 && oy === 0) continue;
+
+          const nx = px + ox;
+          const ny = py + oy;
+
+          const c = classifyAt(nx, ny);
+          if (!c) continue;
+
+          if (!isDrivable(c.name)) {
+            touchesNonDrivable = true;
+            break;
+          }
+        }
+        if (touchesNonDrivable) break;
+      }
+
+      if (!touchesNonDrivable) continue;
+
+      edges.push([px, py]);
+    }
+  }
+
+  // --- Spatial thinning (prevents clustering) ---
+  const filtered = [];
+  const minDistSq = 16; // 4px spacing
+
+  for (const e of edges) {
+    let keep = true;
+
+    for (const f of filtered) {
+      const dx = e[0] - f[0];
+      const dy = e[1] - f[1];
+
+      if (dx * dx + dy * dy < minDistSq) {
+        keep = false;
+        break;
+      }
+    }
+
+    if (keep) filtered.push(e);
+  }
+
+  if (!filtered.length) return;
+
+  // --- Build instanced meshes ---
+  const postGeom = new THREE.CylinderGeometry(0.07, 0.07, 0.6, 6);
+
+  const matW = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.9
+  });
+
+  const matR = new THREE.MeshStandardMaterial({
+    color: 0xcc1f1f,
+    roughness: 0.9
+  });
+
+  const instW = new THREE.InstancedMesh(postGeom, matW, filtered.length);
+  const instR = new THREE.InstancedMesh(postGeom, matR, filtered.length);
+
+  const m = new THREE.Matrix4();
+
+  let wIdx = 0;
+  let rIdx = 0;
+
+  for (let i = 0; i < filtered.length; i++) {
+
+    const [pxS, pyS] = filtered[i];
+    const [x, z] = pixelToWorld(pxS, pyS);
+
+    m.makeTranslation(x, 0.3, z);
+
+    if (i % 2 === 0) {
+      instW.setMatrixAt(wIdx++, m);
+    } else {
+      instR.setMatrixAt(rIdx++, m);
+    }
+  }
+
+  instW.count = wIdx;
+  instR.count = rIdx;
+
+  scene.add(instW);
+  scene.add(instR);
+}
+// function buildBorderPosts() {
+//   const stride = 4;
+//   const edges = [];
+
+//   const W = sampleW, H = sampleH;
+
+//   // Tunable thresholds
+//   const EDGE_THRESHOLD = 6; // chamfer units (~2px)
+//   const CENTER_REJECT = avgHalfWidthPx * 0.6; // reject near centerline
+
+//   for (let py = 0; py < H; py += stride) {
+//     for (let px = 0; px < W; px += stride) {
+
+//       const i = py * W + px;
+//       if (!trackMask[i]) continue;
+
+//       const dt = trackDT[i];
+
+//       // --- Key filtering ---
+//       if (dt > CENTER_REJECT) continue;  // too central → reject
+//       if (dt < 1) continue;              // too close to noise
+//       if (dt > EDGE_THRESHOLD) continue; // not near boundary
+
+//       edges.push([px, py]);
+//     }
+//   }
+
+//   // Optional: spatial thinning (avoid dense clustering)
+//   const filtered = [];
+//   const minDistSq = 16; // ~4px spacing
+
+//   for (const e of edges) {
+//     let keep = true;
+//     for (const f of filtered) {
+//       const dx = e[0] - f[0];
+//       const dy = e[1] - f[1];
+//       if (dx*dx + dy*dy < minDistSq) {
+//         keep = false;
+//         break;
+//       }
+//     }
+//     if (keep) filtered.push(e);
+//   }
+
+//   if (!filtered.length) return;
+
+//   const postGeom = new THREE.CylinderGeometry(0.07, 0.07, 0.6, 6);
+//   const matW = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 });
+//   const matR = new THREE.MeshStandardMaterial({ color: 0xcc1f1f, roughness: 0.9 });
+
+//   const instW = new THREE.InstancedMesh(postGeom, matW, filtered.length);
+//   const instR = new THREE.InstancedMesh(postGeom, matR, filtered.length);
+
+//   const m = new THREE.Matrix4();
+//   let wIdx = 0, rIdx = 0;
+
+//   for (let i = 0; i < filtered.length; i++) {
+//     const [pxS, pyS] = filtered[i];
+//     const [x, z] = pixelToWorld(pxS, pyS);
+
+//     m.makeTranslation(x, 0.3, z);
+
+//     if (i % 2 === 0) instW.setMatrixAt(wIdx++, m);
+//     else instR.setMatrixAt(rIdx++, m);
+//   }
+
+//   instW.count = wIdx;
+//   instR.count = rIdx;
+
+//   scene.add(instW);
+//   scene.add(instR);
+// }
+// ---------- Spawn on actual track ----------
+// ---------- Start line + lap timing ----------
+let startWorld = null;       // {x, z} of the start point in world coords
+let startForward = null;     // unit (vx, vz) heading direction at the start
+let lapState = {
+  started: false,            // first time the car crosses the line, lap 1 begins
+  count: 0,
+  lapStartMs: 0,
+  lastMs: null,
+  bestMs: null,
+  prevSignedFwd: null,
+  // Reset when the kart is teleported.
+};
+
+let startPoleA = null, startPoleB = null, startLineHalfW = 6;
+function setStartFromConfig() {
+  const [ax, az] = jsonPxToWorld(START_POLE_A_PX[0], START_POLE_A_PX[1]);
+  const [bx, bz] = jsonPxToWorld(START_POLE_B_PX[0], START_POLE_B_PX[1]);
+  startPoleA = { x: ax, z: az };
+  startPoleB = { x: bx, z: bz };
+  startWorld = { x: (ax + bx) / 2, z: (az + bz) / 2 };
+  // Across-line vector A->B
+  const acrossX = bx - ax, acrossZ = bz - az;
+  const acrossLen = Math.hypot(acrossX, acrossZ);
+  startLineHalfW = acrossLen / 2;
+  // Forward = perpendicular (rotated 90° CW). Flip if needed.
+  const sign = START_FORWARD_FLIP ? -1 : 1;
+  startForward = { x:  sign * (-acrossZ / acrossLen),
+                   z:  sign * ( acrossX / acrossLen) };
+  console.log(`start line: ${acrossLen.toFixed(1)} m wide, forward = (${startForward.x.toFixed(2)}, ${startForward.z.toFixed(2)})`);
+}
+
+function spawnOnTrack() {
+  if (!startWorld) setStartFromConfig();
+  car.pos.set(startWorld.x, 0, startWorld.z);
+  // car.yaw such that fwd = (cos(yaw), -sin(yaw)) matches startForward.
+  car.yaw = Math.atan2(-startForward.z, startForward.x);
+  car.speed = 0;
+  // Reset lap state on respawn.
+  lapState.started = false;
+  lapState.count = 0;
+  lapState.lapStartMs = 0;
+  lapState.lastMs = null;
+  lapState.bestMs = null;
+  lapState.prevSignedFwd = null;
+}
+
+function drawStartLine() {
+  if (!startWorld) setStartFromConfig();
+  const right = { x: -startForward.z, z: startForward.x };  // 90° CW from forward
+  const yawAlongRight = Math.atan2(right.z, right.x);
+  const halfW = startLineHalfW;
+
+  // Ground stripe — black-and-white checker via canvas texture.
+  const cv = document.createElement('canvas');
+  cv.width = 256; cv.height = 16;
+  const cctx = cv.getContext('2d');
+  for (let i = 0; i < 16; i++) {
+    cctx.fillStyle = i % 2 ? '#fff' : '#111';
+    cctx.fillRect(i * 16, 0, 16, 16);
+  }
+  const stripeTex = new THREE.CanvasTexture(cv);
+  stripeTex.colorSpace = THREE.SRGBColorSpace;
+  const stripe = new THREE.Mesh(
+    new THREE.PlaneGeometry(halfW * 2, 1.0),
+    new THREE.MeshBasicMaterial({ map: stripeTex, transparent: true, depthWrite: false })
+  );
+  stripe.rotation.x = -Math.PI / 2;
+  stripe.rotation.z = yawAlongRight;
+  stripe.position.set(startWorld.x, 0.04, startWorld.z);
+  scene.add(stripe);
+
+  // Banner gantry: two posts and a top beam, with a "START" banner hanging across.
+  const gantry = new THREE.Group();
+  gantry.position.set(startWorld.x, 0, startWorld.z);
+  gantry.rotation.y = -yawAlongRight;     // rotate the whole thing so its local +X aligns with `right`
+
+  const POST_H = 6.5;
+  const POST_R = 0.18;
+  const postMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.6, metalness: 0.3 });
+  const postGeom = new THREE.CylinderGeometry(POST_R, POST_R, POST_H, 12);
+  // Posts placed exactly at the configured pole pixels (in gantry-local space, that's ±halfW on X).
+  const postL = new THREE.Mesh(postGeom, postMat);
+  postL.position.set(-halfW, POST_H / 2, 0);
+  postL.castShadow = true;
+  gantry.add(postL);
+  const postR = postL.clone(); postR.position.x = halfW; gantry.add(postR);
+
+  // Top beam
+  const beam = new THREE.Mesh(
+    new THREE.BoxGeometry(halfW * 2, 0.25, 0.25),
+    postMat
+  );
+  beam.position.set(0, POST_H, 0);
+  beam.castShadow = true;
+  gantry.add(beam);
+
+  // Banner — render "START" text into a canvas, use as texture on a plane hanging from the beam.
+  const bcv = document.createElement('canvas');
+  bcv.width = 1024; bcv.height = 256;
+  const bctx = bcv.getContext('2d');
+  // Red/white striped background.
+  for (let i = 0; i < 8; i++) {
+    bctx.fillStyle = i % 2 ? '#cc1f1f' : '#ffffff';
+    bctx.fillRect(i * (bcv.width / 8), 0, bcv.width / 8, bcv.height);
+  }
+  bctx.fillStyle = 'rgba(0,0,0,0.55)';
+  bctx.fillRect(64, 40, bcv.width - 128, bcv.height - 80);
+  bctx.fillStyle = '#ffe600';
+  bctx.font = 'bold 150px sans-serif';
+  bctx.textAlign = 'center';
+  bctx.textBaseline = 'middle';
+  bctx.fillText('START / FINISH', bcv.width / 2, bcv.height / 2);
+  const bannerTex = new THREE.CanvasTexture(bcv);
+  bannerTex.colorSpace = THREE.SRGBColorSpace;
+  const banner = new THREE.Mesh(
+    new THREE.PlaneGeometry(halfW * 2, halfW * 2 * 0.25),
+    new THREE.MeshBasicMaterial({ map: bannerTex, side: THREE.DoubleSide, transparent: false })
+  );
+  banner.position.set(0, POST_H - (halfW * 2 * 0.25) / 2 - 0.2, 0);
+  gantry.add(banner);
+
+  // Checkered flag detail above the banner.
+  const fcv = document.createElement('canvas');
+  fcv.width = 128; fcv.height = 32;
+  const fctx = fcv.getContext('2d');
+  const sq = 16;
+  for (let y = 0; y < fcv.height / sq; y++) {
+    for (let x = 0; x < fcv.width / sq; x++) {
+      fctx.fillStyle = (x + y) % 2 ? '#fff' : '#000';
+      fctx.fillRect(x * sq, y * sq, sq, sq);
+    }
+  }
+  const flagTex = new THREE.CanvasTexture(fcv);
+  flagTex.colorSpace = THREE.SRGBColorSpace;
+  const flagBand = new THREE.Mesh(
+    new THREE.PlaneGeometry(halfW * 2, 0.4),
+    new THREE.MeshBasicMaterial({ map: flagTex, side: THREE.DoubleSide })
+  );
+  flagBand.position.set(0, POST_H + 0.2, 0);
+  gantry.add(flagBand);
+
+  scene.add(gantry);
+}
+
+function fmtMs(ms) {
+  if (ms == null) return '—';
+  const m = Math.floor(ms / 60000);
+  const s = ((ms % 60000) / 1000);
+  return `${m}:${s.toFixed(3).padStart(6, '0')}`;
+}
+
+function updateLap(nowMs) {
+  if (!startWorld) return;
+  // Signed distance along forward axis.
+  const dx = car.pos.x - startWorld.x;
+  const dz = car.pos.z - startWorld.z;
+  const fwd  = dx * startForward.x + dz * startForward.z;       // along the heading
+  const side = dx * (-startForward.z) + dz * startForward.x;    // across the line (perpendicular)
+  const within = Math.abs(side) <= START_LINE_HALF_W;
+
+  const prev = lapState.prevSignedFwd;
+  // Crossing the start line forward = sign change of `fwd` from negative to positive
+  // while sideways position is within the line's width.
+  if (prev !== null && prev < 0 && fwd >= 0 && within) {
+    if (!lapState.started) {
+      // First crossing arms the timer.
+      lapState.started = true;
+      lapState.lapStartMs = nowMs;
+      lapState.count = 0;
+    } else {
+      const lapMs = nowMs - lapState.lapStartMs;
+      if (lapMs / 1000 >= MIN_LAP_TIME_S) {
+        lapState.count += 1;
+        lapState.lastMs = lapMs;
+        if (lapState.bestMs == null || lapMs < lapState.bestMs) lapState.bestMs = lapMs;
+        lapState.lapStartMs = nowMs;
+      }
+    }
+  }
+  lapState.prevSignedFwd = fwd;
+}
+
+// ---------- Car / cockpit / camera ----------
+const car = {
+  pos: new THREE.Vector3(0, 0, 0),
+  yaw: 0,
+  speed: 0,
+};
+
+// Rig: carRig (car pos + car yaw) -> viewYaw (mouse) -> pitch -> camera
+const carRig = new THREE.Object3D();
+const viewYaw = new THREE.Object3D();
+const pitchObj = new THREE.Object3D();
+carRig.add(viewYaw);
+viewYaw.add(pitchObj);
+pitchObj.add(camera);
+scene.add(carRig);
+camera.position.set(0, 1.05, 0);  // eye height in carRig space
+
+// Cockpit (parented to carRig, NOT to viewYaw, so it's locked to the kart)
+function buildCockpit() {
+  const g = new THREE.Group();
+
+  // Floor / chassis pan
+  const pan = new THREE.Mesh(
+    new THREE.BoxGeometry(0.85, 0.06, 1.6),
+    new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.7 })
+  );
+  pan.position.set(0, 0.35, -0.7);
+  pan.castShadow = true;
+  g.add(pan);
+
+  // Side pods (red)
+  const podMat = new THREE.MeshStandardMaterial({ color: 0xc01818, roughness: 0.5 });
+  const podL = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.22, 1.1), podMat);
+  podL.position.set(-0.45, 0.45, -0.7); podL.castShadow = true; g.add(podL);
+  const podR = podL.clone(); podR.position.x = 0.45; g.add(podR);
+
+  // Nose cone (red, tapered via scale)
+  const nose = new THREE.Mesh(
+    new THREE.BoxGeometry(0.5, 0.18, 1.2),
+    podMat
+  );
+  nose.position.set(0, 0.4, -1.7);
+  nose.scale.set(0.6, 1, 1);  // taper
+  nose.castShadow = true;
+  g.add(nose);
+
+  // Number plate on nose
+  const plate = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.25, 0.18),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6 })
+  );
+  plate.position.set(0, 0.5, -2.31);
+  g.add(plate);
+
+  // Front wheels (cylinders rotated to roll on Z)
+  const wheelGeom = new THREE.CylinderGeometry(0.22, 0.22, 0.18, 18);
+  const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.9 });
+  const fwL = new THREE.Mesh(wheelGeom, wheelMat);
+  fwL.rotation.z = Math.PI / 2;
+  fwL.position.set(-0.6, 0.22, -1.55);
+  fwL.castShadow = true;
+  g.add(fwL);
+  const fwR = fwL.clone(); fwR.position.x = 0.6; g.add(fwR);
+
+  // Rear wheels (wider)
+  const rWheelGeom = new THREE.CylinderGeometry(0.26, 0.26, 0.28, 18);
+  const rwL = new THREE.Mesh(rWheelGeom, wheelMat);
+  rwL.rotation.z = Math.PI / 2;
+  rwL.position.set(-0.62, 0.26, -0.05);
+  rwL.castShadow = true;
+  g.add(rwL);
+  const rwR = rwL.clone(); rwR.position.x = 0.62; g.add(rwR);
+
+  // Steering column
+  const col = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.025, 0.025, 0.55, 8),
+    new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.6, metalness: 0.4 })
+  );
+  col.rotation.x = Math.PI / 2.6;
+  col.position.set(0, 0.7, -0.85);
+  g.add(col);
+
+  // Steering wheel (parented separately so we can rotate it with steering input)
+  const wheelGroup = new THREE.Group();
+  wheelGroup.position.set(0, 0.85, -0.6);
+  wheelGroup.rotation.x = -Math.PI / 4.5;  // tilt towards driver
+  const ring = new THREE.Mesh(
+    new THREE.TorusGeometry(0.18, 0.025, 10, 24),
+    new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.5 })
+  );
+  wheelGroup.add(ring);
+  // Spokes
+  const spokeMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.6 });
+  for (let i = 0; i < 3; i++) {
+    const s = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.02, 0.03), spokeMat);
+    s.rotation.z = (i / 3) * Math.PI * 2;
+    wheelGroup.add(s);
+  }
+  // Center boss with a tiny accent
+  const boss = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.05, 0.05, 0.04, 12),
+    new THREE.MeshStandardMaterial({ color: 0xc01818, roughness: 0.4 })
+  );
+  boss.rotation.x = Math.PI / 2;
+  wheelGroup.add(boss);
+  g.add(wheelGroup);
+
+  return { group: g, steeringWheel: wheelGroup, frontWheels: [fwL, fwR] };
+}
+const cockpit = buildCockpit();
+carRig.add(cockpit.group);
+
+// ---------- Input ----------
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyR') spawnOnTrack();
+  if (e.code === 'KeyM') setGroundTexture(!showSegmentation);
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+let mouseYaw = 0, mousePitch = 0;
+renderer.domElement.addEventListener('click', () => {
+  renderer.domElement.requestPointerLock();
+});
+addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  mouseYaw   -= e.movementX * 0.0025;
+  mousePitch -= e.movementY * 0.0025;
+  mousePitch = Math.max(-1.0, Math.min(1.0, mousePitch));
+  // Soft-recenter mouseYaw when very far from forward, so the cockpit doesn't end up behind you forever.
+});
+
+// ---------- Physics ----------
+const ENGINE_ACCEL = 12;
+const BRAKE_DECEL = 45;
+const REVERSE_ACCEL = 6;
+const ROLL_RESIST = 0.6;
+const STEER_RATE = 1.6;
+const MIN_TURN_SPEED = 0.5;
+
+// ---------- Loop ----------
+const clock = new THREE.Clock();
+const spdEl = document.getElementById('spd');
+const surfEl = document.getElementById('surf');
+const muEl = document.getElementById('mu');
+const lapNEl = document.getElementById('lapN');
+const lapCurEl = document.getElementById('lapCur');
+const lapLastEl = document.getElementById('lapLast');
+const lapBestEl = document.getElementById('lapBest');
+const posPxEl = document.getElementById('posPx');
+const hdgEl = document.getElementById('hdg');
+
+// ---------- Speedometer ----------
+const SPEEDO_MAX_KMH = 220;
+const SPEEDO_ARC_DEG = 270;          // -135° to +135°
+const speedoNeedle = document.getElementById('speedoNeedle');
+const speedoTxt = document.getElementById('speedoTxt');
+(function buildSpeedoTicks() {
+  const ticks = document.getElementById('speedoTicks');
+  const labels = document.getElementById('speedoLabels');
+  for (let v = 0; v <= SPEEDO_MAX_KMH; v += 20) {
+    const t = v / SPEEDO_MAX_KMH;
+    const ang = (-135 + t * SPEEDO_ARC_DEG) * Math.PI / 180;
+    const cx = 50, cy = 50;
+    const r1 = v % 40 === 0 ? 39 : 41;
+    const r2 = 46;
+    const x1 = cx + Math.sin(ang) * r1, y1 = cy - Math.cos(ang) * r1;
+    const x2 = cx + Math.sin(ang) * r2, y2 = cy - Math.cos(ang) * r2;
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('x1', x1); line.setAttribute('y1', y1);
+    line.setAttribute('x2', x2); line.setAttribute('y2', y2);
+    if (v % 40 === 0) line.setAttribute('stroke-width', '0.9');
+    ticks.appendChild(line);
+    if (v % 40 === 0) {
+      const lr = 33;
+      const lx = cx + Math.sin(ang) * lr, ly = cy - Math.cos(ang) * lr + 1.8;
+      const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      text.setAttribute('x', lx); text.setAttribute('y', ly);
+      text.setAttribute('text-anchor', 'middle');
+      text.textContent = v;
+      labels.appendChild(text);
+    }
+  }
+})();
+function updateSpeedo(kmh) {
+  const v = Math.max(0, Math.min(SPEEDO_MAX_KMH, kmh));
+  const ang = -135 + (v / SPEEDO_MAX_KMH) * SPEEDO_ARC_DEG;
+  speedoNeedle.setAttribute('transform', `rotate(${ang.toFixed(2)} 50 50)`);
+  speedoTxt.textContent = v.toFixed(0);
+}
+
+// ---------- Minimap ----------
+const miniCanvas = document.getElementById('minimapCanvas');
+const miniCtx = miniCanvas.getContext('2d');
+let miniImage = null;
+function loadMinimapImage() {
+  miniImage = new Image();
+  miniImage.src = SEG_IMAGE;     // same file already loaded as texture; browser will cache it
+}
+loadMinimapImage();
+function drawMinimap() {
+  if (!miniImage || !miniImage.complete || groundSize.w === 0) return;
+  const W = miniCanvas.width, H = miniCanvas.height;
+  miniCtx.clearRect(0, 0, W, H);
+  miniCtx.drawImage(miniImage, 0, 0, W, H);
+  // Map world (x,z) to canvas px using JSON image coordinate system.
+  const [px, py] = worldToJsonPx(car.pos.x, car.pos.z);
+  const cx = (px / JSON_IMG_W) * W;
+  const cy = (py / JSON_IMG_H) * H;
+  // Heading triangle pointing along forward direction.
+  const fwdScreenX = Math.cos(car.yaw);
+  const fwdScreenY = Math.sin(car.yaw);   // image-y axis points opposite to world-z, hence the flip
+  const ang = Math.atan2(fwdScreenY, fwdScreenX);
+  miniCtx.save();
+  miniCtx.translate(cx, cy);
+  miniCtx.rotate(-ang);    // canvas y is image-down which matches our convention
+  miniCtx.fillStyle = '#ff2a2a';
+  miniCtx.strokeStyle = '#fff';
+  miniCtx.lineWidth = 1.3;
+  miniCtx.beginPath();
+  miniCtx.moveTo(8, 0);
+  miniCtx.lineTo(-5, 4);
+  miniCtx.lineTo(-5, -4);
+  miniCtx.closePath();
+  miniCtx.fill();
+  miniCtx.stroke();
+  miniCtx.restore();
+  // Start line marker
+  if (startPoleA && startPoleB) {
+    const [ax, ay] = worldToJsonPx(startPoleA.x, startPoleA.z);
+    const [bx, by] = worldToJsonPx(startPoleB.x, startPoleB.z);
+    miniCtx.strokeStyle = '#ffe600';
+    miniCtx.lineWidth = 2;
+    miniCtx.beginPath();
+    miniCtx.moveTo((ax / JSON_IMG_W) * W, (ay / JSON_IMG_H) * H);
+    miniCtx.lineTo((bx / JSON_IMG_W) * W, (by / JSON_IMG_H) * H);
+    miniCtx.stroke();
+  }
+}
+
+let steerVis = 0; // smoothed steering input for visual wheel rotation
+
+function update(dt) {
+  const surface = sampleSurface(car.pos.x, car.pos.z);
+  const throttle = keys['KeyW'] ? 1 : 0;
+  const brakeOrReverse = keys['KeyS'] ? 1 : 0;
+  const steer = (keys['KeyA'] ? 1 : 0) - (keys['KeyD'] ? 1 : 0);
+  const handbrake = keys['ShiftLeft'] || keys['ShiftRight'];
+
+  const muSpeedCap = surface.maxSpeed;
+  if (throttle && car.speed < muSpeedCap) car.speed += ENGINE_ACCEL * surface.mu * dt;
+  if (brakeOrReverse) {
+    if (car.speed > 0.1) car.speed -= BRAKE_DECEL * surface.mu * dt;
+    else {
+      car.speed -= REVERSE_ACCEL * surface.mu * dt;
+      if (car.speed < -muSpeedCap * 0.4) car.speed = -muSpeedCap * 0.4;
+    }
+  }
+  const rr = ROLL_RESIST * (2.0 - surface.mu);
+  if (Math.abs(car.speed) > 0.01) {
+    const sign = Math.sign(car.speed);
+    car.speed -= sign * rr * dt;
+    if (Math.sign(car.speed) !== sign) car.speed = 0;
+  }
+  if (handbrake) {
+    const sign = Math.sign(car.speed);
+    car.speed -= sign * 8 * dt;
+    if (Math.sign(car.speed) !== sign) car.speed = 0;
+  }
+  if (car.speed > muSpeedCap) car.speed = muSpeedCap;
+  if (car.speed < -muSpeedCap * 0.4) car.speed = -muSpeedCap * 0.4;
+
+  if (Math.abs(car.speed) > MIN_TURN_SPEED) {
+    const speedFactor = Math.min(1, Math.abs(car.speed) / 10);
+    car.yaw += steer * STEER_RATE * speedFactor * surface.mu * dt * Math.sign(car.speed);
+  }
+
+  car.pos.x += Math.cos(car.yaw) * car.speed * dt;
+  car.pos.z -= Math.sin(car.yaw) * car.speed * dt;
+
+  // Rig
+  carRig.position.set(car.pos.x, 0, car.pos.z);
+  carRig.rotation.y = car.yaw - Math.PI / 2; // align car +X heading with three -Z forward
+  viewYaw.rotation.y = mouseYaw;
+  pitchObj.rotation.x = mousePitch;
+
+  // Steering wheel + front-wheel visual turn
+  steerVis += (steer - steerVis) * Math.min(1, dt * 8);
+  cockpit.steeringWheel.rotation.z = steerVis * 1.4;
+  for (const fw of cockpit.frontWheels) fw.rotation.y = steerVis * 0.5;
+
+  const kmh = Math.abs(car.speed) * 3.6;
+  spdEl.textContent = kmh.toFixed(0);
+  updateSpeedo(kmh);
+  drawMinimap();
+  surfEl.textContent = surface.name;
+  muEl.textContent = surface.mu.toFixed(2);
+
+  const nowMs = performance.now();
+  updateLap(nowMs);
+  lapNEl.textContent = lapState.count;
+  lapCurEl.textContent = lapState.started ? fmtMs(nowMs - lapState.lapStartMs) : '0:00.000';
+  lapLastEl.textContent = fmtMs(lapState.lastMs);
+  lapBestEl.textContent = fmtMs(lapState.bestMs);
+
+  if (groundSize.w > 0) {
+    const [px, py] = worldToJsonPx(car.pos.x, car.pos.z);
+    posPxEl.textContent = `${px}, ${py}`;
+  }
+  // Convention here matches START_HEADING_DEG: 0 = +x (right), 90 = down, 180 = left, 270 = up.
+  let hdgDeg = (-car.yaw * 180 / Math.PI) % 360;
+  if (hdgDeg < 0) hdgDeg += 360;
+  hdgEl.textContent = hdgDeg.toFixed(0);
+}
+
+function loop() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  update(dt);
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+}
+loop();
+
+addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
