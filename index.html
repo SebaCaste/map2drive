@@ -121,6 +121,8 @@
   Click to lock mouse · W/S throttle &amp; brake · A/D steer · Mouse: look · Shift: handbrake · R: reset · M: toggle photo/segmentation
 </div>
 
+<!-- Importmap polyfill for browsers that don't support importmap natively (older Safari/iOS). -->
+<script async src="https://ga.jspm.io/npm:es-module-shims@1.10.0/dist/es-module-shims.js"></script>
 <script type="importmap">
 {
   "imports": {
@@ -170,8 +172,15 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9cc6e8);
 scene.fog = new THREE.Fog(0x9cc6e8, 250, 900);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(window.devicePixelRatio);
+// Detect mobile *before* renderer creation so we can adapt GPU-intensive settings.
+const IS_MOBILE = (() => {
+  const uaMobile = /Android|iPhone|iPad|iPod|Mobile|webOS|BlackBerry|Windows Phone/i.test(navigator.userAgent);
+  const hasTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  return uaMobile || (hasTouch && Math.min(window.innerWidth, window.innerHeight) < 900);
+})();
+
+const renderer = new THREE.WebGLRenderer({ antialias: !IS_MOBILE, powerPreference: 'high-performance' });
+renderer.setPixelRatio(IS_MOBILE ? Math.min(1.5, window.devicePixelRatio) : window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -183,7 +192,7 @@ const camera = new THREE.PerspectiveCamera(78, window.innerWidth / window.innerH
 const sun = new THREE.DirectionalLight(0xfff1d6, 1.1);
 sun.position.set(120, 220, 80);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(IS_MOBILE ? 512 : 2048, IS_MOBILE ? 512 : 2048);
 sun.shadow.camera.left = -180; sun.shadow.camera.right = 180;
 sun.shadow.camera.top = 180; sun.shadow.camera.bottom = -180;
 sun.shadow.camera.near = 1; sun.shadow.camera.far = 600;
@@ -249,6 +258,7 @@ function setGroundTexture(useSeg) {
 
 // ---------- Surface sampler ----------
 let sampleCtx = null, sampleW = 0, sampleH = 0;
+let sampleBuf = null;   // cached RGBA Uint8ClampedArray of the sampler image
 function setupSampler(img) {
   const c = document.createElement('canvas');
   const maxDim = 1024;
@@ -258,6 +268,9 @@ function setupSampler(img) {
   sampleCtx = c.getContext('2d', { willReadFrequently: true });
   sampleCtx.drawImage(img, 0, 0, c.width, c.height);
   sampleW = c.width; sampleH = c.height;
+  // Read the entire image once into a typed array; per-frame lookups are then O(1) and
+  // never allocate. getImageData(1,1) per call is ~100× slower and creates GC pressure.
+  sampleBuf = sampleCtx.getImageData(0, 0, sampleW, sampleH).data;
 }
 function worldToPixel(x, z) {
   const u = (x + groundSize.w / 2) / groundSize.w;
@@ -281,13 +294,13 @@ function classifyRGB(r, g, b) {
   return best;
 }
 function sampleSurface(x, z) {
-  if (!sampleCtx) return { name: 'asphalt', mu: 1.0, maxSpeed: 30 };
+  if (!sampleBuf) return { name: 'asphalt', mu: 1.0, maxSpeed: 60 };
   const [px, py] = worldToPixel(x, z);
   if (px < 0 || py < 0 || px >= sampleW || py >= sampleH) {
     return { name: 'off-map', mu: 0.2, maxSpeed: 5 };
   }
-  const d = sampleCtx.getImageData(px, py, 1, 1).data;
-  return classifyRGB(d[0], d[1], d[2]);
+  const i = (py * sampleW + px) * 4;
+  return classifyRGB(sampleBuf[i], sampleBuf[i + 1], sampleBuf[i + 2]);
 }
 // ---------- Track analysis: binary mask, distance transform, skeleton centerline ----------
 let trackMask = null;          // Uint8Array, 1 if pixel is "track"
@@ -298,7 +311,7 @@ const CHAMFER_TO_PX = 1 / 3;
 
 function buildTrackAnalysis() {
   const W = sampleW, H = sampleH;
-  const data = sampleCtx.getImageData(0, 0, W, H).data;
+  const data = sampleBuf;
   trackMask = new Uint8Array(W * H);
   for (let i = 0, j = 0; i < trackMask.length; i++, j += 4) {
     const c = classifyRGB(data[j], data[j + 1], data[j + 2]);
@@ -381,9 +394,9 @@ function drawCenterline() {
 }
 
 function classifyAt(px, py) {
-  if (px < 0 || py < 0 || px >= sampleW || py >= sampleH) return null;
-  const d = sampleCtx.getImageData(px, py, 1, 1).data;
-  return classifyRGB(d[0], d[1], d[2]);
+  if (!sampleBuf || px < 0 || py < 0 || px >= sampleW || py >= sampleH) return null;
+  const i = (py * sampleW + px) * 4;
+  return classifyRGB(sampleBuf[i], sampleBuf[i + 1], sampleBuf[i + 2]);
 }
 
 // ---------- World population from VLM JSON ----------
@@ -1046,12 +1059,8 @@ carRig.add(cockpit.group);
 
 // ---------- Input ----------
 const keys = {};
-// ---------- Mobile detection + touch controls ----------
-const isMobile = (() => {
-  const uaMobile = /Android|iPhone|iPad|iPod|Mobile|webOS|BlackBerry|Windows Phone/i.test(navigator.userAgent);
-  const hasTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
-  return uaMobile || (hasTouch && Math.min(window.innerWidth, window.innerHeight) < 900);
-})();
+// ---------- Mobile touch controls (IS_MOBILE was detected at top of file) ----------
+const isMobile = IS_MOBILE;
 if (isMobile) document.body.classList.add('is-mobile');
 function updateOrientationClass() {
   document.body.classList.toggle('portrait', window.innerHeight > window.innerWidth);
@@ -1190,7 +1199,12 @@ function loadMinimapImage() {
   miniImage.src = SEG_IMAGE;     // same file already loaded as texture; browser will cache it
 }
 loadMinimapImage();
+let lastMinimapMs = 0;
+const MINIMAP_INTERVAL_MS = 90;   // ~11 fps — minimap doesn't need 60fps
 function drawMinimap() {
+  const now = performance.now();
+  if (now - lastMinimapMs < MINIMAP_INTERVAL_MS) return;
+  lastMinimapMs = now;
   if (!miniImage || !miniImage.complete || groundSize.w === 0) return;
   const W = miniCanvas.width, H = miniCanvas.height;
   miniCtx.clearRect(0, 0, W, H);
