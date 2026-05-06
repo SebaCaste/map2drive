@@ -85,7 +85,8 @@
   Best:    <span id="lapBest" style="color:#9fffa6">—</span><br/>
   <hr style="border:0;border-top:1px solid #555;margin:4px 0"/>
   Pos px (x,y): <span id="posPx" style="color:#ffd66b">-</span><br/>
-  Heading:      <span id="hdg" style="color:#ffd66b">-</span>°
+  Heading:      <span id="hdg" style="color:#ffd66b">-</span>°<br/>
+  Lateral G:    <span id="latG">0.00</span> g
 </div>
 <div id="minimap"><canvas id="minimapCanvas" width="520" height="292"></canvas></div>
 
@@ -118,7 +119,7 @@
 <div id="orientHint">↻ Rotate your phone to landscape for a better view</div>
 
 <div id="help">
-  Click to lock mouse · W/S throttle &amp; brake · A/D steer · Mouse: look · Shift: handbrake · R: reset · M: toggle photo/segmentation
+  Click to lock mouse · W/S throttle &amp; brake · A/D steer · Mouse: look · Shift: handbrake · R: reset · M: toggle photo/segmentation · B: clear best · N: clear last
 </div>
 
 <!-- Importmap polyfill for browsers that don't support importmap natively (older Safari/iOS). -->
@@ -145,17 +146,18 @@ const JSON_IMG_W = 800, JSON_IMG_H = 449;
 
 // Class palette from vlm_prompt.md — used for nearest-color classification of the segmentation PNG.
 const CLASS_TABLE = [
-  { name: 'track',        rgb: [ 40,  40,  40], mu: 1.00, maxSpeed: 60 },
-  { name: 'runoff',       rgb: [110, 110, 110], mu: 0.75, maxSpeed: 35 },
-  { name: 'parking_road', rgb: [160, 160, 160], mu: 0.90, maxSpeed: 40 },
-  { name: 'curb',         rgb: [220,  40,  40], mu: 0.70, maxSpeed: 30 },
-  { name: 'barrier',      rgb: [255, 120,   0], mu: 0.30, maxSpeed: 10 },
-  { name: 'grass',        rgb: [ 60, 160,  70], mu: 0.35, maxSpeed: 14 },
-  { name: 'tree_canopy',  rgb: [ 20,  80,  30], mu: 0.20, maxSpeed:  6 },
-  { name: 'building',     rgb: [200, 170, 120], mu: 0.10, maxSpeed:  2 },
-  { name: 'vehicle',      rgb: [ 80,  60, 200], mu: 0.10, maxSpeed:  2 },
-  { name: 'rail',         rgb: [180, 180, 180], mu: 0.50, maxSpeed: 18 },
-  { name: 'background',   rgb: [  0,   0,   0], mu: 0.20, maxSpeed:  8 },
+  // m/s top speeds.
+  { name: 'track',        rgb: [ 40,  40,  40], mu: 1.00, maxSpeed: 65 },
+  { name: 'runoff',       rgb: [110, 110, 110], mu: 0.75, maxSpeed: 40 },
+  { name: 'parking_road', rgb: [160, 160, 160], mu: 0.90, maxSpeed: 50 },
+  { name: 'curb',         rgb: [220,  40,  40], mu: 0.70, maxSpeed: 34 },
+  { name: 'barrier',      rgb: [255, 120,   0], mu: 0.30, maxSpeed:  4 },
+  { name: 'grass',        rgb: [ 60, 160,  70], mu: 0.35, maxSpeed:  5 },
+  { name: 'tree_canopy',  rgb: [ 20,  80,  30], mu: 0.20, maxSpeed:  3 },
+  { name: 'building',     rgb: [200, 170, 120], mu: 0.10, maxSpeed:  1 },
+  { name: 'vehicle',      rgb: [ 80,  60, 200], mu: 0.10, maxSpeed:  1 },
+  { name: 'rail',         rgb: [180, 180, 180], mu: 0.50, maxSpeed:  8 },
+  { name: 'background',   rgb: [  0,   0,   0], mu: 0.20, maxSpeed:  3 },
 ];
 
 // ====== Start / finish line ======
@@ -245,6 +247,7 @@ Promise.all([loadTex(MAP_IMAGE), loadTex(SEG_IMAGE), fetch(SCENE_JSON).then(r =>
     buildBorderPosts();
     setStartFromConfig();
     drawStartLine();
+    loadBestLapFromStorage();
     spawnOnTrack();
     document.getElementById('loading').remove();
   });
@@ -777,6 +780,112 @@ let lapState = {
 };
 
 let startPoleA = null, startPoleB = null, startLineHalfW = 6;
+
+// ---- Lap path recording / rendering (best = green, last = orange) ----
+let currentLapPath = [];
+let bestLapPath = null;
+let lastLapPath = null;
+let lastPathSampleMs = 0;
+const PATH_SAMPLE_INTERVAL_MS = 80;   // ~12 Hz — plenty for a smooth line
+let bestLapLine = null;
+let lastLapLine = null;
+
+function makePathLine(colorHex, yOffset) {
+  const mat = new THREE.LineBasicMaterial({
+    color: colorHex, transparent: true, opacity: 0.92, depthWrite: false,
+  });
+  const line = new THREE.Line(new THREE.BufferGeometry(), mat);
+  line.position.y = yOffset;
+  line.renderOrder = 2;
+  scene.add(line);
+  return line;
+}
+function rebuildLine(line, path) {
+  if (!line || !path || path.length < 2) return;
+  const arr = new Float32Array(path.length * 3);
+  for (let i = 0; i < path.length; i++) {
+    arr[i * 3]     = path[i].x;
+    arr[i * 3 + 1] = 0;
+    arr[i * 3 + 2] = path[i].z;
+  }
+  line.geometry.dispose();
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  line.geometry = g;
+}
+function rebuildBestLine() {
+  if (!bestLapLine) bestLapLine = makePathLine(0x44ff66, 0.07);
+  rebuildLine(bestLapLine, bestLapPath);
+}
+function rebuildLastLine() {
+  if (!lastLapLine) lastLapLine = makePathLine(0xff9844, 0.05);
+  rebuildLine(lastLapLine, lastLapPath);
+}
+function pathToPx(path) {
+  return path.map(p => {
+    const [x, y] = worldToJsonPx(p.x, p.z);
+    return [x, y];
+  });
+}
+function pxToPath(arr) {
+  return arr.map(p => {
+    const [x, z] = jsonPxToWorld(p[0], p[1]);
+    return { x, z };
+  });
+}
+function loadBestLapFromStorage() {
+  try {
+    const raw = localStorage.getItem('map2drive.bestLap');
+    if (raw) {
+      const saved = JSON.parse(raw);
+      if (saved && Array.isArray(saved.path)) {
+        bestLapPath = pxToPath(saved.path);
+        if (saved.ms != null) lapState.bestMs = saved.ms;
+        rebuildBestLine();
+        console.log(`loaded saved best lap: ${(saved.ms / 1000).toFixed(3)}s, ${saved.path.length} points`);
+      }
+    }
+    const rawL = localStorage.getItem('map2drive.lastLap');
+    if (rawL) {
+      const saved = JSON.parse(rawL);
+      if (saved && Array.isArray(saved.path)) {
+        lastLapPath = pxToPath(saved.path);
+        if (saved.ms != null) lapState.lastMs = saved.ms;
+        rebuildLastLine();
+      }
+    }
+  } catch (e) { /* ignore */ }
+}
+function saveBestLapToStorage() {
+  if (!bestLapPath) return;
+  try {
+    localStorage.setItem('map2drive.bestLap', JSON.stringify({ ms: lapState.bestMs, path: pathToPx(bestLapPath) }));
+  } catch (e) {}
+}
+function saveLastLapToStorage() {
+  if (!lastLapPath) return;
+  try {
+    localStorage.setItem('map2drive.lastLap', JSON.stringify({ ms: lapState.lastMs, path: pathToPx(lastLapPath) }));
+  } catch (e) {}
+}
+function disposeLine(l) {
+  if (!l) return;
+  scene.remove(l);
+  l.geometry.dispose();
+  l.material.dispose();
+}
+function clearBestLap() {
+  bestLapPath = null;
+  lapState.bestMs = null;
+  disposeLine(bestLapLine); bestLapLine = null;
+  try { localStorage.removeItem('map2drive.bestLap'); } catch (e) {}
+  console.log('cleared best lap');
+}
+function clearLastLap() {
+  lastLapPath = null;
+  disposeLine(lastLapLine); lastLapLine = null;
+  try { localStorage.removeItem('map2drive.lastLap'); } catch (e) {}
+}
 function setStartFromConfig() {
   const [ax, az] = jsonPxToWorld(START_POLE_A_PX[0], START_POLE_A_PX[1]);
   const [bx, bz] = jsonPxToWorld(START_POLE_B_PX[0], START_POLE_B_PX[1]);
@@ -932,17 +1041,35 @@ function updateLap(nowMs) {
       lapState.started = true;
       lapState.lapStartMs = nowMs;
       lapState.count = 0;
+      currentLapPath.length = 0;
     } else {
       const lapMs = nowMs - lapState.lapStartMs;
       if (lapMs / 1000 >= MIN_LAP_TIME_S) {
         lapState.count += 1;
         lapState.lastMs = lapMs;
-        if (lapState.bestMs == null || lapMs < lapState.bestMs) lapState.bestMs = lapMs;
+        // Always store this lap as "last lap" (orange line).
+        lastLapPath = currentLapPath.slice();
+        rebuildLastLine();
+        saveLastLapToStorage();
+        // Best lap (green) only updates on personal best.
+        if (lapState.bestMs == null || lapMs < lapState.bestMs) {
+          lapState.bestMs = lapMs;
+          bestLapPath = currentLapPath.slice();
+          rebuildBestLine();
+          saveBestLapToStorage();
+        }
         lapState.lapStartMs = nowMs;
+        currentLapPath.length = 0;
       }
     }
   }
   lapState.prevSignedFwd = fwd;
+
+  // Sample the path of the lap currently in progress.
+  if (lapState.started && nowMs - lastPathSampleMs >= PATH_SAMPLE_INTERVAL_MS) {
+    currentLapPath.push({ x: car.pos.x, z: car.pos.z });
+    lastPathSampleMs = nowMs;
+  }
 }
 
 // ---------- Car / cockpit / camera ----------
@@ -1115,6 +1242,8 @@ addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'KeyR') spawnOnTrack();
   if (e.code === 'KeyM') setGroundTexture(!showSegmentation);
+  if (e.code === 'KeyB') clearBestLap();
+  if (e.code === 'KeyN') clearLastLap();
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
 
@@ -1132,12 +1261,19 @@ addEventListener('mousemove', e => {
 });
 
 // ---------- Physics ----------
-const ENGINE_ACCEL = 12;
-const BRAKE_DECEL = 45;
-const REVERSE_ACCEL = 6;
-const ROLL_RESIST = 0.6;
-const STEER_RATE = 1.6;
-const MIN_TURN_SPEED = 0.5;
+// Power-curve engine: dv/dt = ENGINE_POWER / max(v, ENGINE_VBASE). Punchy 0–40 km/h, falls
+// off near top speed — closer to how a 270cc rental kart feels than constant accel.
+const ENGINE_POWER     = 60;     // m²/s³ (acc @ v=1 m/s; halves at v=2, etc.)
+const ENGINE_VBASE     = 2.0;    // floor on v in the divisor — defines low-end punchiness
+const ENGINE_BRAKE     = 1.4;    // off-throttle deceleration on top of rolling resistance
+const BRAKE_DECEL      = 25;
+const REVERSE_ACCEL    = 5;
+const ROLL_RESIST      = 0.6;
+const STEER_RATE       = 1.6;
+const MIN_TURN_SPEED   = 0.3;
+const TIRE_GRIP_GS     = 1.25;   // peak lateral grip in g on full-mu surface; >1.0 is karty
+const SCRUB_DRAG_K     = 0.35;   // when over-driving the corner, this scales speed loss
+const G_ACCEL          = 9.81;
 
 // ---------- Loop ----------
 const clock = new THREE.Clock();
@@ -1150,6 +1286,7 @@ const lapLastEl = document.getElementById('lapLast');
 const lapBestEl = document.getElementById('lapBest');
 const posPxEl = document.getElementById('posPx');
 const hdgEl = document.getElementById('hdg');
+const latGEl = document.getElementById('latG');
 
 // ---------- Speedometer ----------
 const SPEEDO_MAX_KMH = 220;
@@ -1231,6 +1368,23 @@ function drawMinimap() {
   miniCtx.fill();
   miniCtx.stroke();
   miniCtx.restore();
+  // Last-lap path (orange) drawn first so the green best-lap sits on top.
+  function drawPath(path, color, width) {
+    if (!path || path.length < 2) return;
+    miniCtx.strokeStyle = color;
+    miniCtx.lineWidth = width;
+    miniCtx.beginPath();
+    for (let i = 0; i < path.length; i++) {
+      const [bx, by] = worldToJsonPx(path[i].x, path[i].z);
+      const x = (bx / JSON_IMG_W) * W;
+      const y = (by / JSON_IMG_H) * H;
+      if (i === 0) miniCtx.moveTo(x, y); else miniCtx.lineTo(x, y);
+    }
+    miniCtx.stroke();
+  }
+  drawPath(lastLapPath, '#ff9844', 2);
+  drawPath(bestLapPath, '#44ff66', 2.4);
+
   // Start line marker
   if (startPoleA && startPoleB) {
     const [ax, ay] = worldToJsonPx(startPoleA.x, startPoleA.z);
@@ -1245,6 +1399,8 @@ function drawMinimap() {
 }
 
 let steerVis = 0; // smoothed steering input for visual wheel rotation
+let bankVis = 0;  // smoothed camera roll into corners
+let shakeVis = 0; // smoothed camera-shake amplitude
 
 function update(dt) {
   const surface = sampleSurface(car.pos.x, car.pos.z);
@@ -1254,7 +1410,16 @@ function update(dt) {
   const handbrake = keys['ShiftLeft'] || keys['ShiftRight'];
 
   const muSpeedCap = surface.maxSpeed;
-  if (throttle && car.speed < muSpeedCap) car.speed += ENGINE_ACCEL * surface.mu * dt;
+
+  // ---- Longitudinal: power-curve throttle + engine-brake when off-throttle ----
+  if (throttle && car.speed < muSpeedCap) {
+    const v = Math.max(ENGINE_VBASE, Math.abs(car.speed));
+    car.speed += (ENGINE_POWER / v) * surface.mu * dt;
+  } else if (!brakeOrReverse && car.speed > 0.1) {
+    // engine braking — happens automatically when you lift off throttle
+    car.speed -= ENGINE_BRAKE * surface.mu * dt;
+    if (car.speed < 0) car.speed = 0;
+  }
   if (brakeOrReverse) {
     if (car.speed > 0.1) car.speed -= BRAKE_DECEL * surface.mu * dt;
     else {
@@ -1270,15 +1435,33 @@ function update(dt) {
   }
   if (handbrake) {
     const sign = Math.sign(car.speed);
-    car.speed -= sign * 8 * dt;
+    car.speed -= sign * 12 * dt;
     if (Math.sign(car.speed) !== sign) car.speed = 0;
   }
   if (car.speed > muSpeedCap) car.speed = muSpeedCap;
   if (car.speed < -muSpeedCap * 0.4) car.speed = -muSpeedCap * 0.4;
 
+  // ---- Lateral: yaw rate clamped by tire grip; over-driving scrubs speed (understeer) ----
+  let yawRate = 0;
+  let lateralG = 0;
   if (Math.abs(car.speed) > MIN_TURN_SPEED) {
-    const speedFactor = Math.min(1, Math.abs(car.speed) / 10);
-    car.yaw += steer * STEER_RATE * speedFactor * surface.mu * dt * Math.sign(car.speed);
+    const speedFactor = Math.min(1, (Math.abs(car.speed) + 2) / 12);
+    const desiredYaw = steer * STEER_RATE * speedFactor * Math.sign(car.speed);
+    const v = Math.abs(car.speed);
+    // Available lateral grip in m/s² and the yaw rate it permits at this speed.
+    const aLatMax  = TIRE_GRIP_GS * surface.mu * G_ACCEL;
+    const yawCap   = aLatMax / Math.max(v, 0.5);
+    const sign = Math.sign(desiredYaw) || 0;
+    const limited = sign * Math.min(Math.abs(desiredYaw), yawCap);
+    yawRate = limited;
+    car.yaw += yawRate * dt;
+    lateralG = (v * Math.abs(yawRate)) / G_ACCEL;
+    // If the driver asked for more bite than the tires can give, scrub forward speed.
+    const overdrive = Math.abs(desiredYaw) - yawCap;
+    if (overdrive > 0) {
+      const scrub = overdrive * v * SCRUB_DRAG_K;
+      car.speed -= Math.sign(car.speed) * scrub * dt;
+    }
   }
 
   car.pos.x += Math.cos(car.yaw) * car.speed * dt;
@@ -1288,7 +1471,15 @@ function update(dt) {
   carRig.position.set(car.pos.x, 0, car.pos.z);
   carRig.rotation.y = car.yaw - Math.PI / 2; // align car +X heading with three -Z forward
   viewYaw.rotation.y = mouseYaw;
-  pitchObj.rotation.x = mousePitch;
+  // Smoothly approach a target bank/shake instead of snapping to it each frame.
+  const targetShake = Math.min(0.04, Math.abs(car.speed) * 0.0015) + Math.min(0.05, lateralG * 0.04);
+  shakeVis += (targetShake - shakeVis) * Math.min(1, dt * 6);
+  pitchObj.rotation.x = mousePitch + (Math.random() - 0.5) * shakeVis * 0.5;
+
+  const targetBank = -Math.min(0.20, lateralG * 0.14) * (yawRate >= 0 ? 1 : -1);
+  // Smooth easing — reach ~95% of target in roughly 0.6 s. Tune the multiplier to taste.
+  bankVis += (targetBank - bankVis) * Math.min(1, dt * 5);
+  pitchObj.rotation.z = bankVis;
 
   // Steering wheel + front-wheel visual turn
   steerVis += (steer - steerVis) * Math.min(1, dt * 8);
@@ -1317,6 +1508,11 @@ function update(dt) {
   let hdgDeg = (-car.yaw * 180 / Math.PI) % 360;
   if (hdgDeg < 0) hdgDeg += 360;
   hdgEl.textContent = hdgDeg.toFixed(0);
+  if (latGEl) {
+    latGEl.textContent = lateralG.toFixed(2);
+    latGEl.style.color = lateralG > TIRE_GRIP_GS * 0.92 ? '#ff5050' :
+                         lateralG > TIRE_GRIP_GS * 0.7  ? '#ffd066' : '#fff';
+  }
 }
 
 function loop() {
